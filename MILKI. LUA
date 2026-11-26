@@ -1,0 +1,1267 @@
+--[[
+  Rusty Rafts v2 | Delta (mobile + pc)
+  Written without access to the game's internals, so detection is heuristic.
+  Visual tab shows live counters. Misc > "Copy scan report" tells you what the script sees.
+]]
+
+local cloneref = cloneref or function(o) return o end
+local function svc(n) return cloneref(game:GetService(n)) end
+local Players = svc("Players")
+local RunService = svc("RunService")
+local UIS = svc("UserInputService")
+local CoreGui = svc("CoreGui")
+local VirtualUser = svc("VirtualUser")
+local RepStorage = svc("ReplicatedStorage")
+local WS = cloneref(workspace)
+local WS_REAL = workspace -- real ref, used for == comparisons inside hooks
+local Terrain = WS.Terrain
+local LP = Players.LocalPlayer
+
+local CFG = {
+	DISASTER_WORDS = { "tsunami", "storm", "bermuda", "whirlpool", "hurricane", "tornado", "disaster" },
+	VALUE_EXTRA_WORDS = { "event", "weather", "hazard" },
+	LOOT_WORDS = { "pick", "collect", "grab", "take", "loot", "salvage", "open", "crate", "chest", "scrap" },
+	LOOT_OBJECT_WORDS = { "crate", "chest", "barrel", "loot", "supply", "debris", "scrap" },
+	ENEMY_NAME_WORDS = { "zombie", "raider", "pirate", "enemy", "bandit", "mutant", "monster", "creature", "soldier", "scavenger" },
+	STAMINA_WORDS = { "stamina", "energy", "sprint" },
+	FIRE_BUTTON_WORDS = { "shoot", "fire", "attack" },
+	AIM_PARTS = { "Head", "HumanoidRootPart" },
+	MAX_ESP_DIST = 1500,
+	LOOT_RANGE_CAP = 20,
+	AFTER_DISASTER_DELAY = 3,
+	MAX_LOCK_SECONDS = 180,
+	SPEED_MULT = 0.6, -- extra speed as a fraction of WalkSpeed
+}
+
+local env = (getgenv and getgenv()) or _G
+if env.__RR_UNLOAD then pcall(env.__RR_UNLOAD) end
+
+local alive = true
+local conns, objs = {}, {}
+local function track(c) conns[#conns + 1] = c return c end
+
+local S = {
+	EnemyLabel = false, EnemyBox = false, EnemyTracer = false,
+	LootLabel = false, LootBox = false, LootTracer = false,
+	LootFilter = false, NameDetect = true,
+	SilentAim = false, CameraLock = false, AutoHit = false, ShowFOV = true,
+	FOV = 150, HitRange = 350,
+	FreezeSea = false, ShowBlock = false,
+	InfStamina = false, SpeedBoost = false, AutoLoot = false, LootAny = false, AntiAFK = true,
+	AutoLock = false, ManualLock = false, RemoteSpy = false,
+}
+
+----------------------------------------------------------------- utils
+local function rnd()
+	local t = {}
+	for i = 1, 10 do t[i] = string.char(math.random(97, 122)) end
+	return table.concat(t)
+end
+
+local function hasWordL(l, list)
+	for _, w in ipairs(list) do
+		if string.find(l, w, 1, true) then return true end
+	end
+	return false
+end
+
+local function hasWord(str, list)
+	return hasWordL(string.lower(tostring(str)), list)
+end
+
+local function myRoot()
+	local c = LP.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function myHum()
+	local c = LP.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function pickPart(m)
+	for _, n in ipairs(CFG.AIM_PARTS) do
+		local p = m:FindFirstChild(n)
+		if p and p:IsA("BasePart") then return p end
+	end
+	return m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+end
+
+local function anyPart(inst)
+	if inst:IsA("BasePart") then return inst end
+	if inst:IsA("Attachment") then return inst.Parent and inst.Parent:IsA("BasePart") and inst.Parent or nil end
+	if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true) end
+	return nil
+end
+
+----------------------------------------------------------------- gui base
+local gui = Instance.new("ScreenGui")
+gui.Name = rnd()
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
+local okParent = pcall(function() gui.Parent = (gethui and gethui()) or CoreGui end)
+if not okParent or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+objs[#objs + 1] = gui
+
+local overlay = Instance.new("Frame")
+overlay.BackgroundTransparency = 1
+overlay.Size = UDim2.fromScale(1, 1)
+overlay.Active = false
+overlay.Parent = gui
+
+local fovCircle = Instance.new("Frame")
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+fovCircle.BackgroundTransparency = 1
+fovCircle.Visible = false
+fovCircle.Parent = overlay
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = fovCircle
+	local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(255, 255, 255); s.Thickness = 1.5; s.Parent = fovCircle
+end
+
+----------------------------------------------------------------- esp drawing
+local function makeEntry(color)
+	local e = {}
+	e.box = Instance.new("Frame")
+	e.box.BackgroundTransparency = 1; e.box.BorderSizePixel = 0; e.box.Visible = false; e.box.Parent = overlay
+	local st = Instance.new("UIStroke"); st.Color = color; st.Thickness = 1.5; st.Parent = e.box
+	e.label = Instance.new("TextLabel")
+	e.label.BackgroundTransparency = 1; e.label.TextColor3 = color; e.label.TextSize = 13
+	e.label.Font = Enum.Font.GothamBold; e.label.TextStrokeTransparency = 0.4
+	e.label.Size = UDim2.fromOffset(240, 16); e.label.AnchorPoint = Vector2.new(0.5, 1)
+	e.label.Visible = false; e.label.Parent = overlay
+	e.line = Instance.new("Frame")
+	e.line.BorderSizePixel = 0; e.line.BackgroundColor3 = color
+	e.line.AnchorPoint = Vector2.new(0.5, 0.5); e.line.Visible = false; e.line.Parent = overlay
+	return e
+end
+
+local function hideEntry(e)
+	e.box.Visible = false; e.label.Visible = false; e.line.Visible = false
+end
+
+local function destroyEntry(e)
+	e.box:Destroy(); e.label:Destroy(); e.line:Destroy()
+end
+
+local function projectBox(cam, rec, part)
+	local cf, size = part.CFrame, part.Size
+	if rec.kind == "enemy" then
+		local ok, c, s = pcall(rec.inst.GetBoundingBox, rec.inst)
+		if ok and s.Magnitude < 60 then cf, size = c, s end
+	end
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	local any = false
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				local p = cam:WorldToViewportPoint(cf:PointToWorldSpace(Vector3.new(size.X / 2 * x, size.Y / 2 * y, size.Z / 2 * z)))
+				if p.Z > 0 then
+					any = true
+					if p.X < minX then minX = p.X end
+					if p.Y < minY then minY = p.Y end
+					if p.X > maxX then maxX = p.X end
+					if p.Y > maxY then maxY = p.Y end
+				end
+			end
+		end
+	end
+	if not any then return nil end
+	if maxX - minX < 14 then local c = (maxX + minX) / 2; minX, maxX = c - 7, c + 7 end
+	if maxY - minY < 14 then local c = (maxY + minY) / 2; minY, maxY = c - 7, c + 7 end
+	return minX, minY, maxX, maxY
+end
+
+local function drawLine(frame, a, b)
+	local d = b - a
+	frame.Size = UDim2.fromOffset(d.Magnitude, 1.5)
+	frame.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+	frame.Rotation = math.deg(math.atan2(d.Y, d.X))
+	frame.Visible = true
+end
+
+local enemies, loot = {}, {}
+local ENEMY_COLOR = Color3.fromRGB(255, 70, 70)
+local LOOT_COLOR = Color3.fromRGB(80, 220, 255)
+
+local function partOf(rec)
+	if rec.kind == "enemy" then return pickPart(rec.inst) end
+	if rec.kind == "tool" then return rec.obj:FindFirstChild("Handle") or rec.obj:FindFirstChildWhichIsA("BasePart") end
+	if rec.kind == "obj" then return anyPart(rec.obj) end
+	local p = rec.obj.Parent
+	return p and anyPart(p) or nil
+end
+
+local function recAlive(rec)
+	if not rec.inst.Parent then return false end
+	if rec.hum then return rec.hum.Health > 0 end
+	return true
+end
+
+local function render(rec, color, wantLabel, wantBox, wantTracer, cam, rootPos, from)
+	local e = rec.e
+	local shown = false
+	if wantLabel or wantBox or wantTracer then
+		local part = partOf(rec)
+		if part and part.Parent and (rec.kind ~= "enemy" or recAlive(rec)) then
+			local dist = rootPos and (part.Position - rootPos).Magnitude or 0
+			if dist <= CFG.MAX_ESP_DIST then
+				local p = cam:WorldToViewportPoint(part.Position)
+				if p.Z > 0 then
+					shown = true
+					if not e then e = makeEntry(color); rec.e = e end
+					local minX, minY, maxX, maxY = projectBox(cam, rec, part)
+					if wantBox and minX then
+						e.box.Position = UDim2.fromOffset(minX, minY)
+						e.box.Size = UDim2.fromOffset(maxX - minX, maxY - minY)
+						e.box.Visible = true
+					else
+						e.box.Visible = false
+					end
+					if wantLabel then
+						local txt = rec.name .. " [" .. math.floor(dist) .. "m]"
+						if rec.hum then txt = txt .. " HP " .. math.floor(rec.hum.Health) end
+						e.label.Text = txt
+						e.label.Position = UDim2.fromOffset(p.X, (minY or p.Y) - 2)
+						e.label.Visible = true
+					else
+						e.label.Visible = false
+					end
+					if wantTracer then
+						drawLine(e.line, from, Vector2.new(p.X, p.Y))
+					else
+						e.line.Visible = false
+					end
+				end
+			end
+		end
+	end
+	if not shown and e then hideEntry(e) end
+end
+
+----------------------------------------------------------------- scanning
+local disasterInst, disasterVals = {}, {}
+
+local function promptLabel(pr)
+	local base = pr.ObjectText ~= "" and pr.ObjectText or nil
+	if not base then
+		local m = pr:FindFirstAncestorWhichIsA("Model")
+		base = (m and m.Name) or (pr.Parent and pr.Parent.Name) or "item"
+	end
+	if pr.ActionText ~= "" then return base .. " (" .. pr.ActionText .. ")" end
+	return base
+end
+
+local function promptMatch(pr)
+	local parentName = pr.Parent and pr.Parent.Name or ""
+	return hasWord(pr.ActionText .. " " .. pr.ObjectText .. " " .. parentName, CFG.LOOT_WORDS)
+end
+
+local function isOtherChar(inst)
+	local c = LP.Character
+	if c and (inst == c or inst:IsDescendantOf(c)) then return true end
+	return false
+end
+
+local function consider(inst)
+	local l = string.lower(inst.Name)
+	if inst:IsA("Humanoid") then
+		local m = inst.Parent
+		if m and m:IsA("Model") and not Players:GetPlayerFromCharacter(m) then
+			local r = enemies[m]
+			if r then
+				r.hum = inst
+			else
+				enemies[m] = { kind = "enemy", inst = m, hum = inst, name = m.Name }
+			end
+		end
+	elseif inst:IsA("ProximityPrompt") then
+		if not loot[inst] then
+			loot[inst] = { kind = "prompt", obj = inst, inst = inst, name = promptLabel(inst), match = promptMatch(inst) }
+		end
+	elseif inst:IsA("ClickDetector") then
+		if not loot[inst] then
+			local p = inst.Parent
+			loot[inst] = { kind = "click", obj = inst, inst = inst, name = (p and p.Name or "click"), match = true }
+		end
+	elseif inst:IsA("Tool") and inst.Parent == WS_REAL then
+		loot[inst] = { kind = "tool", obj = inst, inst = inst, name = inst.Name, match = true }
+	elseif inst:IsA("Model") then
+		if S.NameDetect and not enemies[inst] and hasWordL(l, CFG.ENEMY_NAME_WORDS)
+			and not Players:GetPlayerFromCharacter(inst) and not isOtherChar(inst)
+			and not (inst.Parent and enemies[inst.Parent]) then
+			enemies[inst] = { kind = "enemy", inst = inst, name = inst.Name }
+		end
+	end
+	if (inst:IsA("Model") or inst:IsA("BasePart")) and not loot[inst] and not enemies[inst]
+		and hasWordL(l, CFG.LOOT_OBJECT_WORDS) and not isOtherChar(inst)
+		and not (inst.Parent and hasWordL(string.lower(inst.Parent.Name), CFG.LOOT_OBJECT_WORDS)) then
+		loot[inst] = { kind = "obj", obj = inst, inst = inst, name = inst.Name, match = true }
+	end
+	if inst:IsA("ValueBase") then
+		if hasWordL(l, CFG.DISASTER_WORDS) or hasWordL(l, CFG.VALUE_EXTRA_WORDS) then
+			disasterVals[inst] = true
+		end
+	elseif hasWordL(l, CFG.DISASTER_WORDS) then
+		disasterInst[inst] = true
+	end
+end
+
+local function unconsider(inst)
+	local r = enemies[inst]
+	if r then if r.e then destroyEntry(r.e) end enemies[inst] = nil end
+	if inst:IsA("Humanoid") and inst.Parent then
+		local r2 = enemies[inst.Parent]
+		if r2 and r2.hum == inst then r2.hum = nil end
+	end
+	local lr = loot[inst]
+	if lr then if lr.e then destroyEntry(lr.e) end loot[inst] = nil end
+	disasterInst[inst] = nil
+	disasterVals[inst] = nil
+end
+
+task.spawn(function()
+	local n = 0
+	for _, d in ipairs(WS:GetDescendants()) do
+		if not alive then return end
+		pcall(consider, d)
+		n += 1
+		if n % 800 == 0 then task.wait() end
+	end
+	for _, d in ipairs(RepStorage:GetDescendants()) do
+		if not alive then return end
+		if d:IsA("ValueBase") then
+			local l = string.lower(d.Name)
+			if hasWordL(l, CFG.DISASTER_WORDS) or hasWordL(l, CFG.VALUE_EXTRA_WORDS) then disasterVals[d] = true end
+		end
+		n += 1
+		if n % 800 == 0 then task.wait() end
+	end
+end)
+track(WS.DescendantAdded:Connect(function(d) pcall(consider, d) end))
+track(WS.DescendantRemoving:Connect(function(d) pcall(unconsider, d) end))
+track(RepStorage.DescendantAdded:Connect(function(d)
+	if d:IsA("ValueBase") then
+		local l = string.lower(d.Name)
+		if hasWordL(l, CFG.DISASTER_WORDS) or hasWordL(l, CFG.VALUE_EXTRA_WORDS) then disasterVals[d] = true end
+	end
+end))
+track(RepStorage.DescendantRemoving:Connect(function(d) disasterVals[d] = nil end))
+
+task.spawn(function()
+	while alive do
+		task.wait(3)
+		for inst, rec in pairs(loot) do
+			if rec.kind == "prompt" and inst.Parent then
+				rec.match = promptMatch(inst)
+				rec.name = promptLabel(inst)
+			end
+		end
+		-- drop enemies detected by name when the toggle is switched off
+		if not S.NameDetect then
+			for m, rec in pairs(enemies) do
+				if not rec.hum then
+					if rec.e then destroyEntry(rec.e) end
+					enemies[m] = nil
+				end
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------- aim / camera / auto hit
+local aimPart = nil
+
+local function updateAim()
+	aimPart = nil
+	if not (S.SilentAim or S.CameraLock or S.AutoHit) then return end
+	local cam = WS.CurrentCamera
+	if not cam then return end
+	local vs = cam.ViewportSize
+	local center = Vector2.new(vs.X / 2, vs.Y / 2)
+	local best = S.FOV
+	for m, rec in pairs(enemies) do
+		if recAlive(rec) then
+			local part = pickPart(m)
+			if part then
+				local p, on = cam:WorldToViewportPoint(part.Position)
+				if on then
+					local d = (Vector2.new(p.X, p.Y) - center).Magnitude
+					if d < best then best = d; aimPart = part end
+				end
+			end
+		end
+	end
+end
+
+local bindName = rnd()
+RunService:BindToRenderStep(bindName, Enum.RenderPriority.Camera.Value + 1, function()
+	if not alive then return end
+	updateAim()
+	if S.CameraLock and aimPart then
+		local cam = WS.CurrentCamera
+		if cam then
+			local cf = cam.CFrame
+			cam.CFrame = cf:Lerp(CFrame.lookAt(cf.Position, aimPart.Position), 0.4)
+		end
+	end
+end)
+
+local fireBtn, fireScan = nil, 0
+local function getFireButton()
+	if fireBtn and fireBtn.Parent and fireBtn.Visible then return fireBtn end
+	if tick() - fireScan < 3 then return nil end
+	fireScan = tick(); fireBtn = nil
+	local pg = LP:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		for _, d in ipairs(pg:GetDescendants()) do
+			if d:IsA("GuiButton") and d.Visible and not d:IsDescendantOf(gui) then
+				local txt = d.Name .. (d:IsA("TextButton") and (" " .. d.Text) or "")
+				if hasWord(txt, CFG.FIRE_BUTTON_WORDS) then fireBtn = d; break end
+			end
+		end
+	end
+	return fireBtn
+end
+
+local function pressButton(b)
+	for _, n in ipairs({ "MouseButton1Down", "MouseButton1Click", "Activated", "MouseButton1Up" }) do
+		local sig = b[n]
+		if firesignal then
+			pcall(firesignal, sig)
+		elseif getconnections then
+			pcall(function()
+				for _, c in ipairs(getconnections(sig)) do c:Fire() end
+			end)
+		end
+	end
+end
+
+local function fireOnce()
+	local fired = false
+	local char = LP.Character
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	if tool then pcall(function() tool:Activate() end); fired = true end
+	local btn = getFireButton()
+	if btn then pressButton(btn); fired = true end
+	if not fired and mouse1click then pcall(mouse1click) end
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.12)
+		if S.AutoHit and aimPart then
+			local root = myRoot()
+			if root and (aimPart.Position - root.Position).Magnitude <= S.HitRange then
+				pcall(fireOnce)
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------- hooks (silent aim + remote spy)
+local ncc = newcclosure or function(f) return f end
+local oldNC, oldIdx
+local spyLog, spyOrder = {}, {}
+
+local function short(v)
+	local t = typeof(v)
+	if t == "string" then return '"' .. string.sub(v, 1, 40) .. '"' end
+	if t == "Instance" then return v.ClassName .. ":" .. v.Name end
+	if t == "table" then return "{table}" end
+	return tostring(v)
+end
+
+local function logRemote(self, method, ...)
+	if typeof(self) ~= "Instance" then return end
+	local path = self:GetFullName()
+	local rec = spyLog[path]
+	if not rec then
+		rec = { n = 0, method = method, class = self.ClassName }
+		spyLog[path] = rec
+		spyOrder[#spyOrder + 1] = path
+	end
+	rec.n += 1
+	local parts = {}
+	for i = 1, select("#", ...) do
+		parts[i] = short((select(i, ...)))
+		if i >= 8 then break end
+	end
+	rec.args = table.concat(parts, ", ")
+end
+
+local function installHooks()
+	if oldNC or not hookmetamethod then return end
+	oldNC = hookmetamethod(game, "__namecall", ncc(function(self, ...)
+		if alive and not (checkcaller and checkcaller()) then
+			local m = getnamecallmethod()
+			if m == "Raycast" and S.SilentAim and aimPart and self == WS_REAL then
+				local n = select("#", ...)
+				local a = { ... }
+				if typeof(a[1]) == "Vector3" and typeof(a[2]) == "Vector3" and a[2].Magnitude > 0 then
+					a[2] = (aimPart.Position - a[1]).Unit * a[2].Magnitude
+					return oldNC(self, table.unpack(a, 1, n))
+				end
+			elseif S.RemoteSpy and (m == "FireServer" or m == "InvokeServer") then
+				pcall(logRemote, self, m, ...)
+			end
+		end
+		return oldNC(self, ...)
+	end))
+	local mouse = LP:GetMouse()
+	oldIdx = hookmetamethod(game, "__index", ncc(function(self, k)
+		if alive and S.SilentAim and aimPart and self == mouse and not (checkcaller and checkcaller()) then
+			if k == "Hit" then return CFrame.new(aimPart.Position) end
+			if k == "Target" then return aimPart end
+		end
+		return oldIdx(self, k)
+	end))
+end
+
+----------------------------------------------------------------- stamina
+local stam, stamGc = {}, {}
+local STAM_SKIP = { "regen", "rate", "cost", "drain", "max" }
+
+local function scanStamina()
+	local list = {}
+	local function addAttrs(inst)
+		for k, v in pairs(inst:GetAttributes()) do
+			if type(v) == "number" and hasWord(k, CFG.STAMINA_WORDS) and not hasWord(k, STAM_SKIP) then
+				local mx = inst:GetAttribute("Max" .. k)
+				list[#list + 1] = { o = inst, attr = k, max = type(mx) == "number" and mx or v }
+			end
+		end
+	end
+	local function addValue(d)
+		if (d:IsA("NumberValue") or d:IsA("IntValue")) and hasWord(d.Name, CFG.STAMINA_WORDS) and not hasWord(d.Name, STAM_SKIP) then
+			local mxv = d.Parent and d.Parent:FindFirstChild("Max" .. d.Name)
+			list[#list + 1] = { o = d, max = (mxv and mxv:IsA("ValueBase") and tonumber(mxv.Value)) or d.Value }
+		end
+	end
+	local char = LP.Character
+	addAttrs(LP)
+	if char then
+		addAttrs(char)
+		local h = char:FindFirstChildOfClass("Humanoid")
+		if h then addAttrs(h) end
+	end
+	for _, r in ipairs({ LP, char }) do
+		if r then
+			for _, d in ipairs(r:GetDescendants()) do addValue(d) end
+		end
+	end
+	local n = 0
+	for _, d in ipairs(RepStorage:GetDescendants()) do
+		n += 1
+		if n % 500 == 0 then task.wait() end
+		if (d:IsA("NumberValue") or d:IsA("IntValue")) and (d:FindFirstAncestor(LP.Name) or d:FindFirstAncestor(tostring(LP.UserId))) then
+			addValue(d)
+		end
+	end
+	stam = list
+end
+
+local function gcScan()
+	if not getgc then return {} end
+	local found = {}
+	pcall(function()
+		local all = getgc(true)
+		for i, v in ipairs(all) do
+			if type(v) == "table" then
+				for k, val in next, v do
+					if type(k) == "string" and type(val) == "number" and hasWord(k, CFG.STAMINA_WORDS) and not hasWord(k, STAM_SKIP) then
+						local mx = rawget(v, "Max" .. k) or rawget(v, k .. "Max")
+						found[#found + 1] = { t = v, k = k, max = type(mx) == "number" and mx or val }
+						if #found >= 20 then return end
+					end
+				end
+			end
+			if i % 3000 == 0 then task.wait() end
+		end
+	end)
+	return found
+end
+
+local function stamStep()
+	for _, ref in ipairs(stam) do
+		if ref.o and ref.o.Parent then
+			local cur
+			if ref.attr then cur = ref.o:GetAttribute(ref.attr) else cur = ref.o.Value end
+			if type(cur) == "number" then
+				if cur > ref.max then ref.max = cur end
+				if cur < ref.max then
+					if ref.attr then ref.o:SetAttribute(ref.attr, ref.max) else ref.o.Value = ref.max end
+				end
+			end
+		end
+	end
+	for _, ref in ipairs(stamGc) do
+		local cur = rawget(ref.t, ref.k)
+		if type(cur) == "number" then
+			if cur > ref.max then ref.max = cur end
+			if cur < ref.max then pcall(rawset, ref.t, ref.k, ref.max) end
+		end
+	end
+end
+
+task.spawn(function()
+	while alive do
+		pcall(scanStamina)
+		task.wait(5)
+	end
+end)
+
+----------------------------------------------------------------- speed boost
+local function speedStep(dt)
+	local root, hum = myRoot(), myHum()
+	if root and hum and hum.MoveDirection.Magnitude > 0 then
+		root.CFrame = root.CFrame + hum.MoveDirection * hum.WalkSpeed * CFG.SPEED_MULT * dt
+	end
+end
+
+----------------------------------------------------------------- sea block
+local platform = Instance.new("Part")
+platform.Name = rnd()
+platform.Anchored = true
+platform.CanCollide = true
+platform.CastShadow = false
+platform.Material = Enum.Material.Neon
+platform.Color = Color3.fromRGB(70, 160, 255)
+platform.Transparency = 1
+platform.Size = Vector3.new(14, 1, 14)
+platform.CFrame = CFrame.new(0, -1e4, 0)
+objs[#objs + 1] = platform
+
+local origWave = { Terrain.WaterWaveSize, Terrain.WaterWaveSpeed }
+local water = { y = nil, src = "none", t = 0, offset = 0 }
+local PARKED = CFrame.new(0, -1e4, 0)
+
+local function isWaterName(l)
+	if string.find(l, "water", 1, true) or string.find(l, "ocean", 1, true) or string.find(l, "wave", 1, true) then return true end
+	return string.match(l, "^sea$") ~= nil or string.match(l, "^sea[^a-z]") ~= nil
+		or string.match(l, "[^a-z]sea$") ~= nil or string.match(l, "[^a-z]sea[^a-z]") ~= nil
+end
+
+local function isWaterInst(inst)
+	local cur, n = inst, 0
+	while cur and cur ~= WS_REAL and n < 4 do
+		if isWaterName(string.lower(cur.Name)) then return true end
+		cur = cur.Parent
+		n += 1
+	end
+	return false
+end
+
+local function castParams()
+	local ex = { platform }
+	if LP.Character then ex[#ex + 1] = LP.Character end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.IgnoreWater = false
+	rp.FilterDescendantsInstances = ex
+	return rp, ex
+end
+
+-- casts down through ships/objects until it reaches water; returns surface Y
+local function detectSea(root)
+	local rp, ex = castParams()
+	local origin = root.Position + Vector3.new(0, 4, 0)
+	for _ = 1, 6 do
+		rp.FilterDescendantsInstances = ex
+		local r = WS:Raycast(origin, Vector3.new(0, -400, 0), rp)
+		if not r then return nil end
+		if r.Material == Enum.Material.Water or isWaterInst(r.Instance) then return r.Position.Y end
+		if r.Instance == Terrain then return nil end
+		ex[#ex + 1] = r.Instance
+	end
+	return nil
+end
+
+local function feetOffset(root, hum)
+	return math.max(3, hum.HipHeight + root.Size.Y / 2)
+end
+
+local function seaStep()
+	local root, hum = myRoot(), myHum()
+	if not (root and hum) then return end
+	local now = tick()
+	if now - water.t > 0.5 then
+		water.t = now
+		local y = detectSea(root)
+		if y then
+			water.y = y; water.src = "detected"
+		elseif not water.y and hum:GetState() == Enum.HumanoidStateType.Swimming then
+			water.y = root.Position.Y + 1; water.src = "swim"
+		end
+	end
+	platform.Transparency = S.ShowBlock and 0.55 or 1
+	if not water.y then platform.CFrame = PARKED return end
+	local pos = root.Position
+	local rp = castParams()
+	local r = WS:Raycast(pos, Vector3.new(0, -8, 0), rp)
+	local onSolid = r and r.Material ~= Enum.Material.Water and not isWaterInst(r.Instance)
+	if onSolid then
+		platform.CFrame = PARKED
+		return
+	end
+	local top = water.y + 0.1 + water.offset
+	platform.CFrame = CFrame.new(pos.X, top - 0.5, pos.Z)
+	local feet = pos.Y - feetOffset(root, hum)
+	if feet < top - 1 and feet > top - 40 then
+		root.CFrame = root.CFrame + Vector3.new(0, top + feetOffset(root, hum) + 0.2 - pos.Y, 0)
+		local v = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+	end
+end
+
+local function setSea(on)
+	if on then
+		Terrain.WaterWaveSize = 0
+		Terrain.WaterWaveSpeed = 0
+		platform.Parent = WS_REAL
+	else
+		Terrain.WaterWaveSize = origWave[1]
+		Terrain.WaterWaveSpeed = origWave[2]
+		platform.CFrame = PARKED
+		platform.Parent = nil
+	end
+end
+
+----------------------------------------------------------------- ship lock (disasters)
+local lock = { on = false, part = nil, off = nil, mode = nil, since = 0, cool = 0, releaseAt = nil }
+local disasterName = nil
+
+local function findShipPart()
+	local root = myRoot()
+	if not root then return nil end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local ex = { platform }
+	if LP.Character then ex[2] = LP.Character end
+	rp.FilterDescendantsInstances = ex
+	local r = WS:Raycast(root.Position, Vector3.new(0, -15, 0), rp)
+	if r and r.Instance and r.Instance:IsA("BasePart") and r.Instance ~= Terrain then return r.Instance end
+	return nil
+end
+
+local function startLock(mode)
+	local root, part = myRoot(), findShipPart()
+	if not (root and part) then return false end
+	lock.on = true; lock.mode = mode; lock.part = part
+	lock.off = part.CFrame:ToObjectSpace(root.CFrame)
+	lock.since = tick(); lock.releaseAt = nil
+	return true
+end
+
+local function stopLock()
+	lock.on = false; lock.part = nil; lock.mode = nil
+end
+
+local function truthy(v, nameMatch)
+	local t = type(v)
+	if t == "boolean" then return v and nameMatch end
+	if t == "number" then return v > 0 and nameMatch end
+	if t == "string" then
+		local l = string.lower(v)
+		if hasWordL(l, CFG.DISASTER_WORDS) then return true end
+		return nameMatch and l ~= "" and l ~= "none" and l ~= "false" and l ~= "0" and l ~= "calm" and l ~= "clear"
+	end
+	return false
+end
+
+local function disasterActive()
+	for inst in pairs(disasterInst) do
+		if inst.Parent then return true, inst.Name end
+	end
+	for inst in pairs(disasterVals) do
+		if inst.Parent then
+			local nm = hasWord(inst.Name, CFG.DISASTER_WORDS)
+			if truthy(inst.Value, nm) then return true, inst.Name .. "=" .. tostring(inst.Value) end
+		end
+	end
+	for _, r in ipairs({ WS_REAL, RepStorage }) do
+		for k, v in pairs(r:GetAttributes()) do
+			if truthy(v, hasWord(k, CFG.DISASTER_WORDS) or hasWord(k, CFG.VALUE_EXTRA_WORDS)) then
+				return true, k .. "=" .. tostring(v)
+			end
+		end
+	end
+	return false, nil
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.4)
+		if S.AutoLock then
+			local active, who = disasterActive()
+			disasterName = active and who or nil
+			if active then
+				lock.releaseAt = nil
+				if not lock.on then
+					if tick() > lock.cool then startLock("auto") end
+				elseif lock.mode == "auto" and tick() - lock.since > CFG.MAX_LOCK_SECONDS then
+					stopLock(); lock.cool = tick() + 30
+				end
+			elseif lock.on and lock.mode == "auto" then
+				if not lock.releaseAt then
+					lock.releaseAt = tick() + CFG.AFTER_DISASTER_DELAY
+				elseif tick() >= lock.releaseAt then
+					stopLock()
+				end
+			end
+		else
+			disasterName = nil
+			if lock.on and lock.mode == "auto" then stopLock() end
+		end
+	end
+end)
+
+track(LP.CharacterAdded:Connect(function() stopLock() end))
+
+----------------------------------------------------------------- auto loot
+task.spawn(function()
+	while alive do
+		task.wait(0.3)
+		if S.AutoLoot then
+			local root = myRoot()
+			if root then
+				for inst, rec in pairs(loot) do
+					if (rec.match or S.LootAny) and inst.Parent then
+						local part = partOf(rec)
+						if part then
+							local d = (part.Position - root.Position).Magnitude
+							if rec.kind == "prompt" then
+								if inst.Enabled and fireproximityprompt and d <= math.min(inst.MaxActivationDistance, CFG.LOOT_RANGE_CAP) then
+									pcall(fireproximityprompt, inst)
+								end
+							elseif rec.kind == "click" then
+								if fireclickdetector and d <= math.min(inst.MaxActivationDistance, CFG.LOOT_RANGE_CAP) then
+									pcall(fireclickdetector, inst)
+								end
+							elseif firetouchinterest and d <= 25 then
+								pcall(function()
+									firetouchinterest(root, part, 0)
+									firetouchinterest(root, part, 1)
+								end)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------- anti afk
+track(LP.Idled:Connect(function()
+	if S.AntiAFK then
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+end))
+
+----------------------------------------------------------------- main loops
+track(RunService.RenderStepped:Connect(function()
+	if not alive then return end
+	local cam = WS.CurrentCamera
+	if not cam then return end
+	local vs = cam.ViewportSize
+	fovCircle.Visible = (S.SilentAim or S.CameraLock or S.AutoHit) and S.ShowFOV
+	fovCircle.Size = UDim2.fromOffset(S.FOV * 2, S.FOV * 2)
+	fovCircle.Position = UDim2.fromOffset(vs.X / 2, vs.Y / 2)
+	local root = myRoot()
+	local rootPos = root and root.Position
+	local from = Vector2.new(vs.X / 2, vs.Y)
+	for _, rec in pairs(enemies) do
+		render(rec, ENEMY_COLOR, S.EnemyLabel, S.EnemyBox, S.EnemyTracer, cam, rootPos, from)
+	end
+	for _, rec in pairs(loot) do
+		if rec.match or not S.LootFilter then
+			render(rec, LOOT_COLOR, S.LootLabel, S.LootBox, S.LootTracer, cam, rootPos, from)
+		elseif rec.e then
+			hideEntry(rec.e)
+		end
+	end
+end))
+
+local lastSlow, lastWave = 0, 0
+track(RunService.Heartbeat:Connect(function(dt)
+	if not alive then return end
+	if lock.on then
+		local root = myRoot()
+		if root and lock.part and lock.part.Parent then
+			root.CFrame = lock.part.CFrame * lock.off
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		elseif root then
+			local part = findShipPart()
+			if part then lock.part = part; lock.off = part.CFrame:ToObjectSpace(root.CFrame) end
+		end
+	end
+	if S.SpeedBoost and not lock.on then pcall(speedStep, dt) end
+	if S.FreezeSea then pcall(seaStep) end
+	local now = tick()
+	if now - lastSlow >= 0.1 then
+		lastSlow = now
+		if S.InfStamina then pcall(stamStep) end
+	end
+	if S.FreezeSea and now - lastWave >= 1 then
+		lastWave = now
+		Terrain.WaterWaveSize = 0
+		Terrain.WaterWaveSpeed = 0
+	end
+end))
+
+----------------------------------------------------------------- scan report
+local function scanReport()
+	local lines = {}
+	local function count(map, keyFn)
+		local c, order = {}, {}
+		for _, rec in pairs(map) do
+			local k = keyFn(rec)
+			if not c[k] then c[k] = 0; order[#order + 1] = k end
+			c[k] += 1
+		end
+		table.sort(order)
+		return c, order
+	end
+	local ec, eo = count(enemies, function(r) return r.name .. (r.hum and "" or " (no humanoid)") end)
+	lines[#lines + 1] = "== enemies =="
+	for i, k in ipairs(eo) do if i <= 30 then lines[#lines + 1] = k .. " x" .. ec[k] end end
+	local lc, lo = count(loot, function(r) return r.kind .. ": " .. r.name end)
+	lines[#lines + 1] = "== items =="
+	for i, k in ipairs(lo) do if i <= 40 then lines[#lines + 1] = k .. " x" .. lc[k] end end
+	lines[#lines + 1] = "== workspace children =="
+	for i, c in ipairs(WS_REAL:GetChildren()) do
+		if i <= 60 then lines[#lines + 1] = c.ClassName .. " " .. c.Name end
+	end
+	lines[#lines + 1] = "== replicatedstorage children =="
+	for i, c in ipairs(RepStorage:GetChildren()) do
+		if i <= 40 then lines[#lines + 1] = c.ClassName .. " " .. c.Name end
+	end
+	lines[#lines + 1] = "== stamina refs: " .. #stam .. " values, " .. #stamGc .. " gc"
+	lines[#lines + 1] = "== sea: " .. tostring(water.y) .. " (" .. water.src .. ")"
+	return table.concat(lines, "\n")
+end
+
+----------------------------------------------------------------- menu
+local BG = Color3.fromRGB(24, 24, 28)
+local OFFC = Color3.fromRGB(48, 48, 56)
+local ONC = Color3.fromRGB(46, 160, 100)
+local WHITE = Color3.fromRGB(235, 235, 240)
+local GREY = Color3.fromRGB(170, 170, 185)
+
+local W, H = 440, 280
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(W, H)
+panel.Position = UDim2.fromOffset(60, 60)
+panel.BackgroundColor3 = BG
+panel.BorderSizePixel = 0
+panel.Parent = gui
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = panel
+end
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
+title.BorderSizePixel = 0
+title.Text = "Rusty Rafts v2"
+title.TextColor3 = WHITE
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Parent = panel
+
+local tabBar = Instance.new("Frame")
+tabBar.Position = UDim2.fromOffset(6, 36)
+tabBar.Size = UDim2.fromOffset(92, H - 42)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = panel
+do
+	local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 4); l.Parent = tabBar
+end
+
+local content = Instance.new("Frame")
+content.Position = UDim2.fromOffset(104, 36)
+content.Size = UDim2.fromOffset(W - 110, H - 42)
+content.BackgroundTransparency = 1
+content.ClipsDescendants = true
+content.Parent = panel
+
+local tabs, tabBtns = {}, {}
+local function selectTab(name)
+	for n, f in pairs(tabs) do
+		f.Visible = (n == name)
+		tabBtns[n].BackgroundColor3 = (n == name) and ONC or OFFC
+	end
+end
+
+local function newTab(name)
+	local sf = Instance.new("ScrollingFrame")
+	sf.Size = UDim2.fromScale(1, 1)
+	sf.BackgroundTransparency = 1
+	sf.BorderSizePixel = 0
+	sf.ScrollBarThickness = 4
+	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	sf.CanvasSize = UDim2.new()
+	sf.Visible = false
+	sf.Parent = content
+	local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 4); l.HorizontalAlignment = Enum.HorizontalAlignment.Center; l.Parent = sf
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 30)
+	b.BackgroundColor3 = OFFC
+	b.BorderSizePixel = 0
+	b.Text = name
+	b.TextColor3 = WHITE
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.Parent = tabBar
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = b
+	tabs[name] = sf; tabBtns[name] = b
+	track(b.MouseButton1Click:Connect(function() selectTab(name) end))
+	return sf
+end
+
+local rows = {}
+
+local function header(p, text)
+	local t = Instance.new("TextLabel")
+	t.Size = UDim2.new(1, -8, 0, 18)
+	t.BackgroundTransparency = 1
+	t.Text = text
+	t.TextColor3 = Color3.fromRGB(150, 150, 165)
+	t.Font = Enum.Font.GothamBold
+	t.TextSize = 12
+	t.Parent = p
+	return t
+end
+
+local function infoLabel(p)
+	local t = Instance.new("TextLabel")
+	t.Size = UDim2.new(1, -8, 0, 34)
+	t.BackgroundTransparency = 1
+	t.TextColor3 = GREY
+	t.Font = Enum.Font.Gotham
+	t.TextSize = 11
+	t.TextWrapped = true
+	t.Text = ""
+	t.Parent = p
+	return t
+end
+
+local function mkBtn(p, text)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -8, 0, 28)
+	b.BackgroundColor3 = OFFC
+	b.BorderSizePixel = 0
+	b.TextColor3 = WHITE
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.Text = text
+	b.Parent = p
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = b
+	return b
+end
+
+local function toggle(p, text, key, onChange)
+	local b = mkBtn(p, text)
+	local function refresh()
+		b.Text = text .. (S[key] and "   [ON]" or "   [OFF]")
+		b.BackgroundColor3 = S[key] and ONC or OFFC
+	end
+	rows[key] = refresh
+	refresh()
+	track(b.MouseButton1Click:Connect(function()
+		S[key] = not S[key]
+		refresh()
+		if onChange then pcall(onChange, S[key]) end
+	end))
+end
+
+local function button(p, text, fn)
+	local b = mkBtn(p, text)
+	track(b.MouseButton1Click:Connect(function() pcall(fn, b) end))
+	return b
+end
+
+local function stepper(p, getText, onStep)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -8, 0, 28)
+	row.BackgroundTransparency = 1
+	row.Parent = p
+	local function mk(txt, x)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0.2, -2, 1, 0)
+		b.Position = UDim2.new(x, 0, 0, 0)
+		b.BackgroundColor3 = OFFC; b.TextColor3 = WHITE; b.Font = Enum.Font.GothamBold
+		b.TextSize = 16; b.BorderSizePixel = 0; b.Text = txt; b.Parent = row
+		return b
+	end
+	local minus, plus = mk("-", 0), mk("+", 0.8)
+	local lab = Instance.new("TextLabel")
+	lab.Size = UDim2.new(0.6, 0, 1, 0); lab.Position = UDim2.new(0.2, 0, 0, 0)
+	lab.BackgroundTransparency = 1; lab.TextColor3 = WHITE; lab.Font = Enum.Font.GothamMedium; lab.TextSize = 13
+	lab.Parent = row
+	local function upd() lab.Text = getText() end
+	upd()
+	track(minus.MouseButton1Click:Connect(function() onStep(-1); upd() end))
+	track(plus.MouseButton1Click:Connect(function() onStep(1); upd() end))
+	return upd
+end
+
+-- Visual
+local tVisual = newTab("Visual")
+local visInfo = infoLabel(tVisual)
+header(tVisual, "Enemies")
+toggle(tVisual, "Name / dist / HP", "EnemyLabel")
+toggle(tVisual, "Box", "EnemyBox")
+toggle(tVisual, "Tracers", "EnemyTracer")
+toggle(tVisual, "Detect by name too", "NameDetect")
+header(tVisual, "Items")
+toggle(tVisual, "Item names", "LootLabel")
+toggle(tVisual, "Box", "LootBox")
+toggle(tVisual, "Tracers", "LootTracer")
+toggle(tVisual, "Only loot keywords", "LootFilter")
+
+-- Combat
+local tCombat = newTab("Combat")
+toggle(tCombat, "Silent aim (FOV)", "SilentAim", function(on) if on then installHooks() end end)
+toggle(tCombat, "Camera lock (FOV)", "CameraLock")
+toggle(tCombat, "Auto hit", "AutoHit")
+toggle(tCombat, "Show FOV circle", "ShowFOV")
+header(tCombat, "FOV size")
+stepper(tCombat, function() return "FOV " .. S.FOV end, function(d) S.FOV = math.clamp(S.FOV + d * 10, 40, 500) end)
+header(tCombat, "Auto hit range")
+stepper(tCombat, function() return "Range " .. S.HitRange end, function(d) S.HitRange = math.clamp(S.HitRange + d * 25, 25, 1000) end)
+
+-- Water
+local tWater = newTab("Water")
+local waterInfo = infoLabel(tWater)
+toggle(tWater, "Freeze sea (block under me)", "FreezeSea", setSea)
+toggle(tWater, "Show block", "ShowBlock")
+header(tWater, "Block height")
+stepper(tWater, function() return "offset " .. string.format("%.1f", water.offset) end, function(d)
+	water.offset = math.clamp(water.offset + d * 0.5, -10, 10)
+end)
+button(tWater, "Recalibrate sea level", function() water.y = nil; water.src = "none"; water.t = 0 end)
+button(tWater, "Set sea level = my feet", function()
+	local root, hum = myRoot(), myHum()
+	if root and hum then water.y = root.Position.Y - feetOffset(root, hum); water.src = "manual" end
+end)
+
+-- Misc
+local tMisc = newTab("Misc")
+local lockInfo = infoLabel(tMisc)
+header(tMisc, "Player")
+toggle(tMisc, "Infinite stamina", "InfStamina", function(on)
+	if on then
+		task.spawn(function()
+			pcall(scanStamina)
+			if #stam == 0 then stamGc = gcScan() end
+		end)
+	end
+end)
+toggle(tMisc, "Speed boost", "SpeedBoost")
+toggle(tMisc, "Auto loot", "AutoLoot")
+toggle(tMisc, "Loot any prompt (risky)", "LootAny")
+toggle(tMisc, "Anti-AFK", "AntiAFK")
+header(tMisc, "Disasters")
+toggle(tMisc, "Auto lock to ship", "AutoLock")
+toggle(tMisc, "Lock to ship (manual)", "ManualLock", function(on)
+	if on then
+		if not startLock("manual") then S.ManualLock = false; rows.ManualLock() end
+	else
+		if lock.mode == "manual" then stopLock() end
+	end
+end)
+header(tMisc, "Debug")
+toggle(tMisc, "Remote spy", "RemoteSpy", function(on) if on then installHooks() end end)
+button(tMisc, "Copy remote log", function(b)
+	local lines = {}
+	for _, path in ipairs(spyOrder) do
+		local r = spyLog[path]
+		lines[#lines + 1] = string.format("[%d] %s (%s:%s) args: %s", r.n, path, r.class, r.method, r.args or "")
+	end
+	local txt = table.concat(lines, "\n")
+	if setclipboard then pcall(setclipboard, txt) end
+	if writefile then pcall(writefile, "rr_remotes.txt", txt) end
+	b.Text = "Copied (" .. #lines .. ")"
+	task.delay(1.5, function() if alive then b.Text = "Copy remote log" end end)
+end)
+button(tMisc, "Copy scan report", function(b)
+	local txt = scanReport()
+	if setclipboard then pcall(setclipboard, txt) end
+	if writefile then pcall(writefile, "rr_scan.txt", txt) end
+	b.Text = "Copied"
+	task.delay(1.5, function() if alive then b.Text = "Copy scan report" end end)
+end)
+local unloadBtn = button(tMisc, "Unload", function() end)
+unloadBtn.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+
+selectTab("Visual")
+
+-- live status
+task.spawn(function()
+	while alive do
+		local ne, nl = 0, 0
+		for _, rec in pairs(enemies) do if recAlive(rec) then ne += 1 end end
+		for _, rec in pairs(loot) do if rec.match or not S.LootFilter then nl += 1 end end
+		visInfo.Text = "enemies found: " .. ne .. "\nitems found: " .. nl
+		waterInfo.Text = "sea level: " .. (water.y and string.format("%.1f", water.y) or "unknown") .. " (" .. water.src .. ")"
+		lockInfo.Text = "disaster: " .. (disasterName or "none") .. "\nlock: " .. (lock.on and ("on (" .. tostring(lock.mode) .. ")") or "off")
+		task.wait(0.5)
+	end
+end)
+
+-- drag
+local dragging, dragStart, startPos
+track(title.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging = true; dragStart = i.Position; startPos = panel.Position
+		i.Changed:Connect(function()
+			if i.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end))
+track(UIS.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end))
+
+-- floating show/hide button
+local fab = Instance.new("TextButton")
+fab.Size = UDim2.fromOffset(40, 40)
+fab.Position = UDim2.fromOffset(10, 70)
+fab.BackgroundColor3 = BG
+fab.BorderSizePixel = 0
+fab.Text = "RR"
+fab.TextColor3 = WHITE
+fab.Font = Enum.Font.GothamBold
+fab.TextSize = 14
+fab.Parent = gui
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = fab
+end
+track(fab.MouseButton1Click:Connect(function() panel.Visible = not panel.Visible end))
+
+----------------------------------------------------------------- unload
+local function unload()
+	alive = false
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() RunService:UnbindFromRenderStep(bindName) end)
+	for _, o in ipairs(objs) do pcall(function() o:Destroy() end) end
+	pcall(function()
+		Terrain.WaterWaveSize = origWave[1]
+		Terrain.WaterWaveSpeed = origWave[2]
+	end)
+	stopLock()
+	env.__RR_UNLOAD = nil
+end
+env.__RR_UNLOAD = unload
+track(unloadBtn.MouseButton1Click:Connect(unload))
